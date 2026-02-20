@@ -93,6 +93,6 @@ jobs:
 
 欢迎提交Issue和Pull Request！
 
-## 致谢
+## 最佳实践
 
-本项目基于原有的PR预览工作流开发，感谢所有贡献者。
+- [Win12 pr preview](https://github.com/tangyuan0821/win12-pr-preview) - 生产环境实现案例
