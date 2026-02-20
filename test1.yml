@@ -1,0 +1,206 @@
+name: upstream-pr-preview
+
+on:
+  schedule:
+    - cron: "0 * * * *"  
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: '仅处理指定的上游PR编号（可选）'
+        required: false
+  # repository_dispatch：由上游仓库的 workflow 主动调用本仓库的 API 触发
+  repository_dispatch:
+    types:
+      - upstream-pr-opened
+      - upstream-pr-synchronize
+      - upstream-pr-reopened
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-pr-preview
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: tjy-gitnub/win12
+  PREVIEW_ROOT: site
+  PREVIEW_TIMEZONE: Asia/Shanghai
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      prs: ${{ steps.collect.outputs.prs }}
+    steps:
+      - name: 收集需要处理的PR列表（大号，只读）
+        id: collect
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_READ_PAT }}
+          INPUT_PR: ${{ github.event.client_payload.pr_number || github.event.inputs.pr_number || '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_PR" ]; then
+            PRS="[$INPUT_PR]"
+          else
+            PRS=$(gh api "repos/${UPSTREAM_REPO}/pulls" --paginate --jq '[.[] | select(.state=="open" and .draft==false and .merged==false) | .number]')
+          fi
+          if [ -z "$PRS" ]; then
+            PRS="[]"
+          fi
+          echo "prs=$PRS" >> "$GITHUB_OUTPUT"
+          echo "Target PRs: $PRS"
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: prepare
+    permissions:
+      contents: write
+    env:
+      UPSTREAM_REPO: tjy-gitnub/win12
+      PR_LIST: ${{ needs.prepare.outputs.prs }}
+    steps:
+      - name: 检出当前仓库（默认token，仅用于部署）
+        uses: actions/checkout@v4
+
+      - name: 拉取并构建预览（大号，只读）
+        id: build
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_READ_PAT }}
+          PREVIEW_ROOT: site
+        run: |
+          set -euo pipefail
+          mkdir -p "$PREVIEW_ROOT"
+          echo "$PR_LIST" | jq -e . > /tmp/prs.json
+          : > /tmp/comment_info.jsonl
+          : > /tmp/validate.list
+
+          PR_COUNT=$(jq 'length' /tmp/prs.json)
+          if [ "$PR_COUNT" -eq 0 ]; then
+            echo "No open PRs found; will clean gh-pages."
+            echo "暂无进行中的PR / No active PR previews" > "$PREVIEW_ROOT/README.md"
+          fi
+
+          for pr in $(jq -r '.[]' /tmp/prs.json); do
+            if ! [[ "$pr" =~ ^[0-9]+$ ]]; then
+              echo "Invalid PR number ${pr}, skipping (PR编号格式异常，已跳过)"
+              continue
+            fi
+            data=$(gh api "repos/${UPSTREAM_REPO}/pulls/${pr}")
+            state=$(echo "$data" | jq -r '.state')
+            draft=$(echo "$data" | jq -r '.draft')
+            merged=$(echo "$data" | jq -r '.merged')
+            if [ "$state" != "open" ] || [ "$draft" = "true" ] || [ "$merged" = "true" ]; then
+              echo "Skip #$pr (state=$state draft=$draft merged=$merged)"
+              continue
+            fi
+
+            sha=$(echo "$data" | jq -r '.head.sha')
+            head_repo=$(echo "$data" | jq -r '.head.repo.full_name')
+
+            if [ -z "$head_repo" ] || [ "$head_repo" = "null" ]; then
+              echo "Head repo missing for PR #$pr, skipping (源仓库缺失，已跳过)"
+              continue
+            fi
+
+            if ! printf '%s' "$head_repo" | grep -Eq '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
+              echo "Unexpected head repo format for PR #$pr, skipping (源仓库格式异常，已跳过)"
+              continue
+            fi
+
+            archive="pr-${pr}.zip"
+            curl -L --fail --max-filesize 104857600 \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -o "$archive" \
+              "https://api.github.com/repos/${head_repo}/zipball/${sha}"
+            unzip -q "$archive" -d "/tmp/src-$pr"
+            SRC_DIRS=$(find "/tmp/src-$pr" -maxdepth 1 -type d -not -path "/tmp/src-$pr" || true)
+            SRC_DIR=$(printf "%s\n" "$SRC_DIRS" | head -n 1)
+            if [ -z "$SRC_DIR" ]; then
+              echo "Unable to locate extracted source directory for PR #$pr, skipping (解压目录缺失，已跳过)"
+              continue
+            fi
+            SRC_COUNT=$(printf "%s\n" "$SRC_DIRS" | grep -c . || true)
+            if [ "${SRC_COUNT:-0}" -ne 1 ]; then
+              echo "Unexpected archive layout for PR #$pr, skipping (解压目录数量异常，已跳过)"
+              continue
+            fi
+            rsync -a --delete "${SRC_DIR}/" "$PREVIEW_ROOT/pr-${pr}/"
+            target_html="$PREVIEW_ROOT/pr-${pr}/desktop.html"
+            if [ -f "$target_html" ]; then
+              banner='<div id="pr-preview-disclaimer" style="position:fixed;top:0;left:0;right:0;z-index:2147483647;padding:12px 44px 12px 16px;background:#d92d20;color:#fff;font:700 14px/1.4 -apple-system,BlinkMacSystemFont,&quot;Segoe UI&quot;,sans-serif;box-shadow:0 2px 12px rgba(0,0,0,.25);">本预览环境源自 Pull Request，用于验证部署效果。完整体验请访问 Win12 稳定版本。 / Preview from a Pull Request for deployment validation. Visit the stable version of Win12 for the full experience.<button type="button" aria-label="关闭 Close" onclick="this.parentElement.remove()" style="position:absolute;top:8px;right:10px;border:0;background:transparent;color:#fff;font-size:22px;line-height:1;cursor:pointer;">×</button></div>'
+              if ! grep -q 'id="pr-preview-disclaimer"' "$target_html"; then
+                if grep -qi '</body>' "$target_html"; then
+                  BANNER="$banner" perl -0pi -e 's#</body>#$ENV{BANNER}</body>#i' "$target_html"
+                elif grep -qi '</html>' "$target_html"; then
+                  BANNER="$banner" perl -0pi -e 's#</html>#$ENV{BANNER}</html>#i' "$target_html"
+                else
+                  printf '\n%s\n' "$banner" >> "$target_html"
+                fi
+              fi
+            fi
+            echo "$pr $sha" >> /tmp/validate.list
+          done
+
+          if [ -s /tmp/validate.list ]; then
+            pushd "$PREVIEW_ROOT" >/dev/null
+            python3 -m http.server 8000 >"/tmp/http-server.log" 2>&1 &
+            SERVER_PID=$!
+            trap "kill $SERVER_PID 2>/dev/null" EXIT
+            sleep 2
+            while read -r pr sha; do
+              if curl -fsS "http://localhost:8000/pr-${pr}/desktop.html" >/dev/null; then
+                printf '{"number":%s,"sha":"%s"}\n' "$pr" "$sha" >> /tmp/comment_info.jsonl
+              else
+                echo "desktop.html validation failed for PR #$pr, skipping comment and deployment (desktop.html 校验失败，已跳过)" >&2
+                tail -n 50 "/tmp/http-server.log" || true
+                rm -rf "${PREVIEW_ROOT}/pr-${pr}"
+              fi
+            done < /tmp/validate.list
+            trap - EXIT
+            kill "$SERVER_PID" 2>/dev/null || true
+            popd >/dev/null
+          fi
+
+      - name: 部署到 GitHub Pages（默认token）
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: site
+          publish_branch: gh-pages
+          commit_message: "chore: update PR previews"
+
+      - name: 发布/更新预览评论（小号，仅PR写权限）
+        if: success() && github.event_name != 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.PREVIEW_COMMENT_PAT }}
+          BOT_USERNAME: ${{ secrets.PREVIEW_COMMENT_USERNAME }}
+          UPSTREAM_REPO: tjy-gitnub/win12
+          PREVIEW_ROOT_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          MARKER="PR 预览"
+          if [ ! -s /tmp/comment_info.jsonl ]; then
+            echo "No successful builds; skip commenting."
+            exit 0
+          fi
+          if [ -n "${BOT_USERNAME:-}" ]; then
+            bot_login="$BOT_USERNAME"
+          else
+            bot_login=$(gh api user --jq .login) || { echo "Failed to resolve bot login from token (无法通过令牌解析机器人账号)"; exit 1; }
+          fi
+
+          while IFS= read -r line; do
+            pr=$(echo "$line" | jq -r '.number')
+            sha=$(echo "$line" | jq -r '.sha')
+            url="${PREVIEW_ROOT_URL}/pr-${pr}/desktop.html"
+            deployed_at=$(env TZ="${PREVIEW_TIMEZONE}" date "+%Y-%m-%d %H:%M:%S %Z")
+
+            body=$(printf '**%s**\n\n| 项目 | 详情 |\n|------|------|\n| 预览链接 | %s |\n| 提交哈希 | `%s` |\n| 部署时间（%s） | %s |\n\n> [!TIP]\n> 💡 若 PR 继续提交，新预览将自动覆盖并更新本评论。\n> 如您发现问题，欢迎通过[issues](https://github.com/tangyuan0821/win12-pr-preview/issues)提交反馈。\n' "$MARKER" "$url" "$sha" "$PREVIEW_TIMEZONE" "$deployed_at")
+            existing=$(gh api "repos/${UPSTREAM_REPO}/issues/${pr}/comments" --jq 'map(select(.user.login==$bot and (.body | contains($marker)))) | sort_by(.updated_at) | last | .id' --arg bot "$bot_login" --arg marker "$MARKER" || true)
+            if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+              gh api "repos/${UPSTREAM_REPO}/issues/comments/${existing}" -X PATCH -f body="$body"
+            else
+              gh api "repos/${UPSTREAM_REPO}/issues/${pr}/comments" -X POST -f body="$body"
+            fi
+          done < /tmp/comment_info.jsonl
