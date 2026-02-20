@@ -1,4 +1,4 @@
-name: 'PRPeek '
+name: ' PRPeek '
 description: 'Generate preview deployments for pull requests from an upstream repository and deploy to GitHub Pages'
 author: 'tangyuan0821'
 inputs:
